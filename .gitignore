@@ -1,0 +1,52 @@
+# Python bytecode/cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Native extensions and build outputs
+*.so
+*.dylib
+*.dll
+*.a
+*.o
+*.obj
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Tool caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDE/editor
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Project artifacts
+profile_trace/
+*.pt
+*.pth
+*.ckpt
+*.onnx
+
+# CUDA extension artifacts
+src/models/custom_cuda/build/
+src/models/custom_cuda/*.so

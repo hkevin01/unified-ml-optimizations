@@ -1,0 +1,4 @@
+* text=auto eol=lf
+
+# Treat notebook files as binary-like for cleaner diffs unless nbdime is configured.
+*.ipynb -text
