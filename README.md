@@ -395,19 +395,19 @@ Controls everything about the training run: optimizer hyperparameters, schedulin
 
 ### Category A - Low-Rank Decomposition
 
-Standard attention uses three weight matrices W_Q, W_K, W_V each of size `d_model × d_model`. For `d_model=512`, each projection is 262,144 parameters and requires 262,144 multiply-add operations per token. Low-rank decomposition replaces each of these with two smaller matrices: `A` of size `d_model × rank` and `B` of size `rank × d_model`. The product `A @ B` approximates the original full-rank matrix, but uses only `2 × d_model × rank` parameters - a compression ratio of `d_model / (2 × rank)`.
+Standard attention uses three weight matrices W_Q, W_K, W_V each of size `d_model × d_model`. For `d_model=512`, each projection contains 262,144 parameters and requires 262,144 multiply-add operations per token per forward pass. Low-rank decomposition (inspired directly by the LoRA paper) replaces each of these with two smaller matrices: `A` of size `d_model × rank` and `B` of size `rank × d_model`. The product `A @ B` approximates the original full-rank matrix, but the parameter count drops from `d_model²` to `2 × d_model × rank`. At the default `rank=32` and `d_model=512`, each projection is compressed by 8x in both parameters and FLOPs.
 
-At the default `rank=32` and `d_model=512`, each projection is compressed by **8x** in parameters and FLOPs. The three Q, K, V projections together go from 786,432 to 98,304 parameters per layer.
+The key insight behind why this works is that weight matrices in trained neural networks are empirically low-rank. The singular value decomposition of a trained weight matrix typically has a handful of large singular values and many near-zero ones. Low-rank decomposition exploits this by constraining the weight to live in a low-dimensional subspace from the start of training, rather than learning a full-rank matrix and discarding its small singular values afterward.
 
 ```mermaid
 graph LR
-    subgraph FULL["Full-Rank Projection"]
-        X1["x\n(B, L, 512)"] -->|"W: 512×512\n262,144 params"| Y1["q\n(B, L, 512)"]
+    subgraph FULL["Full-Rank Projection (512x512 = 262,144 params)"]
+        X1["x\n(B, L, 512)"] -->|"W: 512x512\n262,144 params"| Y1["q\n(B, L, 512)"]
     end
 
-    subgraph LOWRANK["Low-Rank Projection (rank=32)"]
-        X2["x\n(B, L, 512)"] -->|"A: 512×32\n16,384 params"| H["h\n(B, L, 32)"]
-        H -->|"B: 32×512\n16,384 params"| Y2["q\n(B, L, 512)"]
+    subgraph LOWRANK["Low-Rank Projection r=32 (32,768 params - 8x fewer)"]
+        X2["x\n(B, L, 512)"] -->|"A: 512x32\n16,384 params"| H["h\n(B, L, 32)"]
+        H -->|"B: 32x512\n16,384 params"| Y2["q\n(B, L, 512)"]
     end
 
     style FULL fill:#e74c3c22
@@ -415,51 +415,112 @@ graph LR
 ```
 
 > [!IMPORTANT]
-> Matrix B is initialized with near-zero values (std=0.01) while A is initialized with Kaiming uniform. This means the product `A @ B` is approximately zero at initialization, similar to the LoRA initialization strategy. This prevents the low-rank layers from dominating the residual stream early in training before they have learned meaningful structure.
+> Matrix B is initialized with near-zero values (std=0.01) while A uses Kaiming uniform initialization. This means the product `A @ B` is approximately zero at initialization, matching the LoRA initialization strategy. This prevents the low-rank layers from dominating the residual stream early in training, before they have learned meaningful structure. If both matrices were initialized normally, the initial low-rank projections would have random large values that destabilize the attention computation.
 
 ### Category B - Triton Fused Kernel
 
-In a standard feedforward layer, the computation `GELU(x @ W.T + b)` involves two separate GPU operations: a matrix multiplication followed by an element-wise GELU activation. Between these two operations, the GPU must write the output of the matmul (an `(M, N)` float tensor) to HBM, then read it back for the GELU pass. For a hidden dimension of `d_model=512` with `ffn_dim=2048`, this intermediate buffer is `batch_size × seq_len × 2048 × 4` bytes per layer.
+In a standard feedforward layer, the computation `GELU(x @ W.T + b)` involves two separate GPU operations: a matrix multiplication (GEMM) followed by an element-wise GELU activation. Between these two operations, the GPU must write the GEMM output (an `(M, N)` float tensor) to High Bandwidth Memory (HBM), then read it back for the GELU pass. This HBM round-trip is the bottleneck because modern GPUs have far more arithmetic throughput than memory bandwidth - an A100 GPU can perform 312 TFLOPS of FP16 arithmetic but its HBM bandwidth is only 2 TB/s.
 
-The Triton kernel `_fused_linear_gelu_kernel` eliminates this round-trip entirely by computing the GELU activation inside the matmul accumulation loop, in registers, before writing the result to HBM. The GELU approximation used is the tanh variant: `x × 0.5 × (1 + tanh(√(2/π) × (x + 0.044715x³)))`.
+The Triton kernel `_fused_linear_gelu_kernel` eliminates this round-trip entirely. It computes the GELU activation inside the matmul accumulation loop, in SRAM registers, before writing the result to HBM. The output tensor is written exactly once. The GELU approximation used is the tanh variant: `x × 0.5 × (1 + tanh(√(2/π) × (x + 0.044715x³)))`.
+
+> [!NOTE]
+> Triton kernels use a tile-based programming model. The matrix is divided into 2D tiles that fit in the GPU's L1 cache (SRAM). Each tile is loaded once, the full fused computation is performed on it in registers, and the result is written back. The `tl.constexpr` parameters `BLOCK_M` and `BLOCK_N` control tile dimensions and are auto-tuned by Triton's autotuner for your specific GPU's cache size and warp count.
 
 ### Category B - INT8 Quantization
 
-The `QuantizedLinear` module demonstrates the quantization-aware training (QAT) path. During the forward pass, the float32 weight matrix is quantized to INT8 using symmetric per-tensor absolute-maximum scaling, then immediately dequantized back to float32 before the matrix multiply. The gradient flows through the dequantized weights unmodified (straight-through estimator). At inference time, a real deployment would skip the dequantization and use an INT8 GEMM kernel, reducing memory bandwidth by 4x and enabling faster matrix multiplications on hardware with INT8 tensor cores.
+The `QuantizedLinear` module demonstrates the quantization-aware training (QAT) path for the classifier head. During the forward pass, the float32 weight matrix is quantized to INT8 using symmetric per-tensor absolute-maximum scaling (`scale = max(|W|) / 127`), then immediately dequantized back to float32 before the matrix multiply. This "fake quantization" approach allows gradients to flow through the quantized weight path during training, simulating the numerical noise of INT8 without actually requiring an INT8 GEMM kernel.
+
+The straight-through estimator (STE) is the key training trick here. The quantize-then-dequantize operation has a gradient of zero for weights outside the clamp range (because rounding is a step function). STE replaces this zero gradient with the identity gradient, allowing weights to still be updated even when their quantized representation is at the clamp boundary. This is mathematically an approximation but works remarkably well in practice.
+
+At inference time in a production deployment, the dequantization step would be skipped and the matrix multiply would use a native INT8 GEMM kernel. On hardware with INT8 tensor cores (Turing, Ampere, Ada Lovelace architectures), INT8 GEMM is 2-4x faster than FP16 GEMM, and the weight memory footprint is 4x smaller than FP32.
 
 ### Category C - AdamW Parameter Groups
 
-A common mistake when implementing AdamW is applying weight decay to all parameters uniformly. Weight decay is an L2 regularization term that adds `-λ × w` to each weight gradient, encouraging weights to stay near zero. For 2-D weight matrices this is desirable and improves generalization. But for 1-D parameters - biases, LayerNorm scale (gamma) and shift (beta) - weight decay actively hurts convergence because these parameters control critical calibration constants, not learned features. The `build_adamw_optimizer` function splits parameters into two groups: those with `ndim >= 2` receive `weight_decay=0.1`, and those with `ndim < 2` receive `weight_decay=0.0`.
+AdamW (Adam with decoupled weight decay) was introduced to fix a subtle bug in L2 regularization applied within the Adam update rule. In vanilla Adam+L2, the weight decay is scaled by the adaptive learning rate, making the effective regularization stronger for infrequently-updated parameters. AdamW decouples the weight decay from the moment estimates, applying it directly to the parameter value as `w = w - lr * weight_decay * w`, which gives uniform L2 regularization regardless of gradient history.
 
-Additionally, when CUDA is available, the optimizer is constructed with `fused=True`, which activates PyTorch's fused AdamW CUDA kernel. This kernel performs the AdamW parameter update (bias correction, moment estimates, weight decay, learning rate scaling) in a single CUDA kernel launch per parameter group instead of one kernel per operation, reducing kernel launch overhead and improving GPU utilization.
+Beyond AdamW correctness, a second important consideration is which parameters should receive weight decay at all. Weight decay encourages parameters toward zero, which is a useful inductive bias for 2-D weight matrices because it prevents any single weight from dominating the output. But for 1-D parameters - biases, LayerNorm scale (gamma), and LayerNorm shift (beta) - weight decay is harmful. These parameters are calibration constants that center and scale activations at each layer. Forcing them toward zero prevents LayerNorm from learning the appropriate scale for each layer's activation distribution, degrading convergence. The `build_adamw_optimizer` function automatically separates parameters by dimensionality to apply the correct decay to each group.
+
+> [!TIP]
+> To identify which parameters fall into each group, you can inspect the optimizer after construction: `[p['weight_decay'] for p in optimizer.param_groups]` will return `[0.1, 0.0]` for the two groups. `[len(p['params']) for p in optimizer.param_groups]` will show how many parameters are in each group.
+
+---
+
+## Memory and Compute Breakdown
+
+Understanding where memory goes and where FLOPs are spent is essential for optimizing training throughput. The following table breaks down each component of the model by parameter count and estimated forward-pass FLOPs per token, using the default configuration (`d_model=512`, `rank=32`, `n_layers=6`, `seq_len=128`).
+
+| <sub>#</sub> | <sub>Component</sub> | <sub>Parameters</sub> | <sub>% of Total</sub> | <sub>FLOPs per Token</sub> | <sub>Memory (FP32)</sub> | <sub>Optimization Applied</sub> |
+|---|---|---|---|---|---|---|
+| <sub>1</sub> | <sub>Token Embedding</sub> | <sub>8,388,608</sub> | <sub>~64%</sub> | <sub>0 (lookup, not matmul)</sub> | <sub>32 MB</sub> | <sub>None - shared across layers</sub> |
+| <sub>2</sub> | <sub>LowRankAttention Q/K/V x6 layers</sub> | <sub>589,824</sub> | <sub>~4.5%</sub> | <sub>196,608 per layer</sub> | <sub>2.25 MB</sub> | <sub>Category A: 8x fewer than full-rank</sub> |
+| <sub>3</sub> | <sub>Attention Output Proj x6 layers</sub> | <sub>1,572,864</sub> | <sub>~12%</sub> | <sub>524,288 per layer</sub> | <sub>6 MB</sub> | <sub>Full-rank (output proj is not low-ranked)</sub> |
+| <sub>4</sub> | <sub>FFN FusedLinearGELU x6 layers</sub> | <sub>1,572,864</sub> | <sub>~12%</sub> | <sub>1,048,576 per layer</sub> | <sub>6 MB</sub> | <sub>Category B: fused kernel, no intermediate HBM write</sub> |
+| <sub>5</sub> | <sub>FFN Up-Projection x6 layers</sub> | <sub>1,572,864</sub> | <sub>~12%</sub> | <sub>1,048,576 per layer</sub> | <sub>6 MB</sub> | <sub>None - standard linear</sub> |
+| <sub>6</sub> | <sub>LayerNorm params x12 (pre + post)</sub> | <sub>12,288</sub> | <sub><0.1%</sub> | <sub>Negligible</sub> | <sub>0.05 MB</sub> | <sub>Category C: excluded from weight decay</sub> |
+| <sub>7</sub> | <sub>QuantizedLinear Classifier Head</sub> | <sub>5,120</sub> | <sub><0.1%</sub> | <sub>5,120</sub> | <sub>0.02 MB</sub> | <sub>Category B: INT8 quantized weights</sub> |
+
+> [!NOTE]
+> The token embedding table dominates parameter count at 64% of the total. This is typical for small Transformer models with large vocabularies. At scale (GPT-3 style models), the ratio inverts and the feedforward layers dominate. If you reduce `vocab_size` from 16384 to 1024, the total model size drops from ~13M to ~5M parameters, which significantly speeds up CPU smoke tests.
 
 ---
 
 ## LR Schedule and Pruning Interaction
 
-The following diagram shows how the learning rate schedule and the pruning sparsity ramp are designed to interleave - pruning is intentionally delayed until after the warmup phase so that the model has learned stable representations before weights are zeroed.
+The learning rate schedule and the pruning sparsity ramp are co-designed to complement each other. The key insight is that pruning should not begin until the model has had enough gradient steps to form stable weight representations - if you start pruning at step 0, you remove weights that the model hasn't had a chance to learn, which permanently destroys potential capacity. By delaying pruning until after the warmup phase (step 100), the model first reaches a reasonable solution, and then pruning removes the least important weights while the still-high LR allows the remaining weights to compensate.
+
+The following diagram shows the relationship between the normalized LR (which peaks at step 100 after warmup and decays via cosine to 10% at step 1000) and the normalized sparsity ramp (which starts at step 100 and reaches 30% target by step 800, then stays fixed for the final 200 steps).
 
 ```mermaid
 xychart-beta
     title "LR Schedule vs Pruning Sparsity (over 1000 steps)"
     x-axis [0, 100, 200, 300, 400, 500, 600, 700, 800, 900, 1000]
-    y-axis "Value" 0 --> 1
+    y-axis "Normalized Value" 0 --> 1
     line [0.0, 1.0, 0.97, 0.88, 0.75, 0.59, 0.41, 0.25, 0.12, 0.06, 0.1]
     line [0.0, 0.0, 0.0, 0.11, 0.23, 0.34, 0.45, 0.56, 0.67, 0.78, 0.89]
 ```
 
 > [!NOTE]
-> The x-axis chart above shows normalized LR (blue) and normalized sparsity (orange). Pruning begins at step 100 (warmup end) and reaches its target by step 800. The final 200 steps train with fixed 30% sparsity and decaying LR, allowing the remaining weights to fine-tune into the pruned structure.
+> The chart above shows normalized LR (first line, peaks at 1.0) and normalized sparsity (second line, reaches 0.89 which maps to 30% target sparsity). Pruning begins at step 100 (warmup end) and reaches its target by step 800. The final 200 steps train with fixed 30% sparsity and decaying LR, allowing the remaining weights to fine-tune into the pruned structure without further structural changes.
+
+The interaction between these two schedules produces a third emergent effect: as sparsity increases and the LR decreases simultaneously in the middle of training (steps 200-800), the effective learning rate per active parameter actually stays roughly constant. This coincidence is not a design constraint but it is a useful property for understanding why the training curves tend to be smooth through the pruning phase.
 
 ---
 
 ## Performance Benchmarks
 
-The following table shows theoretical parameter and FLOPs reduction from the low-rank attention optimization at various ranks, for the default `d_model=512` configuration.
+The following table shows theoretical parameter and FLOPs reduction from the low-rank attention optimization at various ranks, for the default `d_model=512` configuration. These numbers represent the Q/K/V projections only; the output projection and feedforward layers are not affected by the `rank` parameter.
 
-| <sub>Rank (r)</sub> | <sub>Params per Q/K/V</sub> | <sub>Total QKV Params (×3)</sub> | <sub>vs Full-Rank</sub> | <sub>Compression</sub> | <sub>Recommended Use Case</sub> |
-|---|---|---|---|---|---|
-| <sub>512 (full)</sub> | <sub>262,144</sub> | <sub>786,432</sub> | <sub>baseline</sub> | <sub>1.0×</sub> | <sub>Maximum expressivity; no compression</sub> |
+| <sub>#</sub> | <sub>Rank (r)</sub> | <sub>Params per Q/K/V</sub> | <sub>Total QKV Params (x3)</sub> | <sub>Delta vs Full-Rank</sub> | <sub>Compression Ratio</sub> | <sub>Recommended Use Case</sub> |
+|---|---|---|---|---|---|---|
+| <sub>1</sub> | <sub>512 (full-rank baseline)</sub> | <sub>262,144</sub> | <sub>786,432</sub> | <sub>baseline</sub> | <sub>1.0x</sub> | <sub>Maximum expressivity; research ablations only</sub> |
+| <sub>2</sub> | <sub>256</sub> | <sub>262,144</sub> | <sub>786,432</sub> | <sub>-0%</sub> | <sub>1.0x</sub> | <sub>Effectively full-rank at this d_model size</sub> |
+| <sub>3</sub> | <sub>128</sub> | <sub>131,072</sub> | <sub>393,216</sub> | <sub>-50%</sub> | <sub>2.0x</sub> | <sub>Light compression; minimal accuracy impact on most tasks</sub> |
+| <sub>4</sub> | <sub>64</sub> | <sub>65,536</sub> | <sub>196,608</sub> | <sub>-75%</sub> | <sub>4.0x</sub> | <sub>Good balance for most classification tasks</sub> |
+| <sub>5</sub> | <sub>32 (project default)</sub> | <sub>32,768</sub> | <sub>98,304</sub> | <sub>-87.5%</sub> | <sub>8.0x</sub> | <sub>Strong compression; works for synthetic and simple real tasks</sub> |
+| <sub>6</sub> | <sub>16</sub> | <sub>16,384</sub> | <sub>49,152</sub> | <sub>-93.75%</sub> | <sub>16.0x</sub> | <sub>Aggressive compression; suitable for small embedding spaces only</sub> |
+| <sub>7</sub> | <sub>8</sub> | <sub>8,192</sub> | <sub>24,576</sub> | <sub>-96.875%</sub> | <sub>32.0x</sub> | <sub>Extreme compression; expect measurable accuracy degradation</sub> |
+
+> [!CAUTION]
+> Compression ratios above 8x (rank <= 32 for d_model=512) will reduce model expressivity enough to impact accuracy on real-world datasets. The synthetic classification task used in this project is simple enough that even rank=8 converges, but production models should always be benchmarked carefully before choosing a rank below d_model/8. Measure validation accuracy, not just training loss.
+
+---
+
+## Hardware Requirements
+
+The project runs on a spectrum of hardware, from a laptop CPU to a data-center GPU. The following table describes what each configuration supports and what is degraded or unavailable.
+
+| <sub>#</sub> | <sub>Hardware Configuration</sub> | <sub>Triton Kernels</sub> | <sub>CUDA Kernel</sub> | <sub>AMP (fp16)</sub> | <sub>Fused AdamW</sub> | <sub>Expected Full-Run Time</sub> | <sub>Recommended For</sub> |
+|---|---|---|---|---|---|---|---|
+| <sub>1</sub> | <sub>CPU only (no GPU)</sub> | <sub>PyTorch fallback</sub> | <sub>Python fallback</sub> | <sub>Disabled</sub> | <sub>Disabled</sub> | <sub>15-25 minutes</sub> | <sub>Code reading, smoke tests, debugging</sub> |
+| <sub>2</sub> | <sub>Consumer GPU: RTX 3060/3070</sub> | <sub>Fully active</sub> | <sub>Fully active</sub> | <sub>fp16 active</sub> | <sub>Active (CUDA >= 11.4)</sub> | <sub>3-5 minutes</sub> | <sub>Full training, hyperparameter search</sub> |
+| <sub>3</sub> | <sub>High-end GPU: RTX 3090/4090</sub> | <sub>Fully active</sub> | <sub>Fully active</sub> | <sub>bf16 preferred</sub> | <sub>Active</sub> | <sub>1-2 minutes</sub> | <sub>Full training with profiling enabled</sub> |
+| <sub>4</sub> | <sub>Data-center GPU: A100/H100</sub> | <sub>Fully active, auto-tuned</sub> | <sub>Fully active</sub> | <sub>bf16 preferred</sub> | <sub>Active, highest throughput</sub> | <sub>Under 1 minute</sub> | <sub>Benchmarking, large-scale ablations</sub> |
+| <sub>5</sub> | <sub>Apple Silicon (M1/M2 MPS)</sub> | <sub>PyTorch fallback (Triton GPU target is CUDA only)</sub> | <sub>Python fallback</sub> | <sub>MPS fp16 partially supported</sub> | <sub>Disabled</sub> | <sub>5-10 minutes</sub> | <sub>Development and testing on macOS</sub> |
+
+> [!NOTE]
+> To use Apple Silicon MPS acceleration, set `device="mps"` in `TrainingConfig`. The MPS backend supports most PyTorch operations but does not support the CUDA-specific `fused=True` optimizer flag or the custom CUDA kernel. Both will fall back gracefully. AMP with MPS is experimental in PyTorch 2.x and may produce inconsistent results on some operations.
+
+---
 | <sub>128</sub> | <sub>131,072</sub> | <sub>393,216</sub> | <sub>-50%</sub> | <sub>2.0×</sub> | <sub>Light compression; minimal accuracy impact</sub> |
 | <sub>64</sub> | <sub>65,536</sub> | <sub>196,608</sub> | <sub>-75%</sub> | <sub>4.0×</sub> | <sub>Good balance for most classification tasks</sub> |
 | <sub>32 (default)</sub> | <sub>32,768</sub> | <sub>98,304</sub> | <sub>-87.5%</sub> | <sub>8.0×</sub> | <sub>Strong compression; works for synthetic tasks</sub> |
