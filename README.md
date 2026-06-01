@@ -11,9 +11,20 @@
 [![License](https://img.shields.io/badge/License-MIT-green?style=for-the-badge)](LICENSE)
 [![Status](https://img.shields.io/badge/Status-Research%20Grade-blue?style=for-the-badge)]()
 
+[![Code Style](https://img.shields.io/badge/Code%20Style-Black-000000?style=flat-square)](https://github.com/psf/black)
+[![Docstring Standard](https://img.shields.io/badge/Docs-NASA%20Style-0B3D91?style=flat-square)]()
+[![AMP](https://img.shields.io/badge/Training-AMP%20fp16%2Fbf16-orange?style=flat-square)]()
+[![CPU Fallback](https://img.shields.io/badge/CPU-Fallback%20Supported-brightgreen?style=flat-square)]()
+[![Triton Kernels](https://img.shields.io/badge/Triton-Custom%20GPU%20Kernels-76B900?style=flat-square&logo=nvidia)]()
+[![INT8 Quant](https://img.shields.io/badge/Quantization-INT8%20QAT-blueviolet?style=flat-square)]()
+[![Low Rank](https://img.shields.io/badge/Attention-Low--Rank%20LoRA--style-blue?style=flat-square)]()
+[![Pruning](https://img.shields.io/badge/Sparsity-Gradual%20Magnitude%20Pruning-red?style=flat-square)]()
+
 *Three optimization categories. One model. Zero compromises.*
 
 </div>
+
+---
 
 ---
 
@@ -22,15 +33,22 @@
 - [Overview](#overview)
 - [Why This Project Exists](#why-this-project-exists)
 - [Architecture](#architecture)
+- [Module Dependency Graph](#module-dependency-graph)
 - [Optimization Categories](#optimization-categories)
+- [Training Pipeline State Machine](#training-pipeline-state-machine)
 - [Tech Stack](#tech-stack)
 - [Project Structure](#project-structure)
 - [Quick Start](#quick-start)
 - [Configuration Reference](#configuration-reference)
 - [Component Deep Dives](#component-deep-dives)
+- [Memory and Compute Breakdown](#memory-and-compute-breakdown)
+- [LR Schedule and Pruning Interaction](#lr-schedule-and-pruning-interaction)
 - [Performance Benchmarks](#performance-benchmarks)
+- [Hardware Requirements](#hardware-requirements)
 - [API Reference](#api-reference)
+- [Extension Guide](#extension-guide)
 - [Troubleshooting](#troubleshooting)
+- [Glossary](#glossary)
 - [References](#references)
 
 ---
@@ -41,6 +59,8 @@ This project is a **single end-to-end machine learning codebase** that demonstra
 
 The model is a **Pre-LN Transformer classifier** with six layers, multi-head attention, and a feedforward network - similar in structure to a small BERT or GPT encoder. Every component has been replaced or augmented with an optimization representative of its category. The attention Q/K/V projections use low-rank matrix factorization. The feedforward network uses a Triton-compiled fused kernel. The classifier head uses INT8 weight quantization. The optimizer separates parameter groups for proper weight decay. The learning rate follows a cosine schedule with linear warmup. Weights are gradually pruned during training using a magnitude-based ramp.
 
+Understanding how these techniques compose in a single model is the core goal of this repository. Each optimization interacts with the others in non-trivial ways: a low-rank factorization changes the curvature of the loss landscape, which affects how AdamW's moment estimates accumulate. A fused kernel changes which tensors touch GPU memory, which influences cache behavior during the backward pass. Pruning modifies the effective rank of the weight matrices mid-training, altering the gradient signal for all downstream parameters. This project makes those interactions visible and reproducible.
+
 > [!IMPORTANT]
 > This project is designed to run on both CPU and GPU. All CUDA and Triton components fall back gracefully to pure PyTorch when a GPU is unavailable, so you can study the code and run smoke tests on any machine.
 
@@ -50,16 +70,20 @@ The model is a **Pre-LN Transformer classifier** with six layers, multi-head att
 
 Most optimization tutorials isolate techniques into independent notebooks: "here is how AdamW works," "here is a Triton kernel," "here is low-rank decomposition." This is pedagogically convenient but misses the point - in real systems, these optimizations compose and interact. A low-rank layer changes the gradient landscape, which affects how AdamW's second moment estimates evolve. A fused kernel changes memory access patterns, which determines how much the learning rate schedule matters for convergence speed.
 
-This codebase presents a **research-grade reference implementation** where every component is production-quality: NASA-style docstrings with explicit preconditions, postconditions, failure modes, and verification strategies; proper AMP (Automatic Mixed Precision) integration; gradient clipping; a profiling harness; and a Jupyter notebook for post-training analysis.
+This codebase presents a **research-grade reference implementation** where every component is production-quality: NASA-style docstrings with explicit preconditions, postconditions, failure modes, and verification strategies; proper AMP (Automatic Mixed Precision) integration; gradient clipping; a profiling harness; and a Jupyter notebook for post-training analysis. The design philosophy is that you should be able to take any individual module from this repository and drop it directly into a production codebase with no modification.
+
+The secondary goal is **explainability**. Comments describe not just what the code does, but why the specific approach was chosen over alternatives - why cosine decay is better than step decay for Transformers, why INT8 is preferred over INT4 for QAT, why the low-rank B matrix is initialized near zero, and why weight decay must be separated from biases and LayerNorm parameters.
 
 > [!NOTE]
-> The synthetic dataset used here is intentionally simple - the goal is to verify that all components integrate correctly and that the loss decreases. Swap in any real dataset (CIFAR-10, WikiText, etc.) by replacing `src/data/dataset.py` with your own DataLoader.
+> The synthetic dataset used here is intentionally simple - the goal is to verify that all components integrate correctly and that the loss decreases. Swap in any real dataset (CIFAR-10, WikiText, etc.) by replacing `src/data/dataset.py` with your own DataLoader. No other files need to change.
 
 ---
 
 ## Architecture
 
-The following diagram shows how data flows through the full system during a single training step, illustrating where each optimization category is applied.
+The model is structured as a stack of identical `TransformerBlock` modules. Each block applies Pre-LN (layer normalization applied *before* the residual branch, not after), which is the key architectural difference from the original 2017 "Attention is All You Need" Transformer. Pre-LN normalization improves gradient flow at initialization, making deep models significantly easier to train at small batch sizes. The attention sub-layer within each block uses low-rank factorized projections for Q, K, and V, while the feedforward sub-layer uses a Triton-fused kernel. The final classification head uses an INT8-quantized linear layer.
+
+The following diagram shows how data flows through the full system during a single training step, illustrating where each optimization category is applied and how the optimizer feedback loop closes.
 
 ```mermaid
 flowchart TD
@@ -96,13 +120,13 @@ flowchart TD
 ```
 
 > [!TIP]
-> The Pre-LN (Layer Normalization before the residual branch) placement is a deliberate architectural choice. Pre-LN Transformers are significantly more stable to train than Post-LN variants, especially at small batch sizes and high learning rates, because the gradient norm at initialization is bounded regardless of depth.
+> The Pre-LN placement (LayerNorm before the residual branch) is a deliberate architectural choice. Pre-LN Transformers are significantly more stable to train than Post-LN variants, especially at small batch sizes and high learning rates, because the gradient norm at initialization is bounded regardless of model depth. Post-LN requires careful warm-up and learning rate tuning to prevent the gradient from exploding in early layers.
 
 ---
 
 ## Module Dependency Graph
 
-The following diagram shows how Python modules depend on each other. Understanding this graph helps you know which file to edit when changing a specific behavior.
+Understanding the module dependency graph is essential before making changes to the codebase. If you want to change the attention mechanism, you only need to modify `low_rank_layer.py` and potentially `base_model.py`. If you want to swap the optimizer, only `optimizer.py` is involved. The graph below makes these boundaries explicit, coloring each node by the optimization category it belongs to.
 
 ```mermaid
 graph LR
@@ -134,27 +158,33 @@ graph LR
     style scheduler fill:#e74c3c,color:#fff
 ```
 
+> [!NOTE]
+> Blue nodes are Category A (mathematical/structural), green nodes are Category B (systems/kernel), and red nodes are Category C (convergence). Grey nodes are shared infrastructure with no category affiliation. `config.py` is the only file imported by both the model and the training loop - all hyperparameters flow from a single source of truth.
+
 ---
 
 ## Optimization Categories
 
-Each of the three categories addresses a fundamentally different bottleneck in ML training. Category A reduces the mathematical cost of the computation itself by exploiting structure in the weight matrices. Category B reduces the hardware cost of executing that computation by minimizing memory traffic between the GPU's compute units and its high-bandwidth memory (HBM). Category C reduces the number of gradient steps needed to reach a given loss value by steering the optimizer toward better trajectories.
+Each of the three categories addresses a fundamentally different bottleneck in ML training. Category A reduces the mathematical cost of the computation itself by exploiting structure in the weight matrices - the insight being that learned weight matrices in trained models are often low-rank, meaning their information can be captured by two smaller matrices with far fewer parameters. Category B reduces the hardware cost of executing that computation by minimizing memory traffic between the GPU's compute units and its high-bandwidth memory (HBM) - the insight being that modern GPUs are memory-bandwidth-limited for many layer sizes, not compute-limited. Category C reduces the number of gradient steps needed to reach a given loss value by steering the optimizer toward better trajectories - the insight being that naive SGD wastes steps and that schedule, decay strategy, and sparsity can all be co-designed.
 
-| <sub>#</sub> | <sub>Category</sub> | <sub>Bottleneck Addressed</sub> | <sub>Technique</sub> | <sub>Files</sub> |
-|---|---|---|---|---|
-| <sub>A</sub> | <sub>Mathematical & Structural</sub> | <sub>Parameter count and FLOP count of linear projections</sub> | <sub>Low-rank factorization of Q, K, V attention projections (A @ B decomposition)</sub> | <sub>low_rank_layer.py</sub> |
-| <sub>B1</sub> | <sub>Systems - Fused Kernel</sub> | <sub>Memory bandwidth waste from writing intermediate activations to HBM</sub> | <sub>Triton fused matmul + GELU in a single kernel pass</sub> | <sub>fused_kernel.py</sub> |
-| <sub>B2</sub> | <sub>Systems - Quantization</sub> | <sub>Weight memory footprint and memory bandwidth during linear projection</sub> | <sub>INT8 symmetric per-tensor quantization with straight-through estimator</sub> | <sub>fused_kernel.py</sub> |
-| <sub>B3</sub> | <sub>Systems - CUDA Kernel</sub> | <sub>Fused activation + quantization without intermediate buffers</sub> | <sub>Hand-written CUDA C++ kernel: ReLU + INT8 quant + dequant</sub> | <sub>custom_cuda/</sub> |
-| <sub>C1</sub> | <sub>Convergence - Optimizer</sub> | <sub>Weight decay incorrectly applied to 1-D parameters (biases, LN scales)</sub> | <sub>AdamW with separate param groups; fused CUDA AdamW kernel</sub> | <sub>optimizer.py</sub> |
-| <sub>C2</sub> | <sub>Convergence - Scheduling</sub> | <sub>Large gradient updates early in training destabilize weights</sub> | <sub>Linear warmup + cosine LR decay to 10% of peak</sub> | <sub>scheduler.py</sub> |
-| <sub>C3</sub> | <sub>Convergence - Pruning</sub> | <sub>Model capacity wasted on near-zero weights that contribute noise</sub> | <sub>Gradual magnitude pruning: 0% to 30% sparsity over training</sub> | <sub>optimizer.py</sub> |
+| <sub>#</sub> | <sub>Category</sub> | <sub>Bottleneck Addressed</sub> | <sub>Technique Used</sub> | <sub>Key Benefit</sub> | <sub>Primary Files</sub> |
+|---|---|---|---|---|---|
+| <sub>A</sub> | <sub>Mathematical & Structural</sub> | <sub>Parameter count and FLOP count of linear projections</sub> | <sub>Low-rank factorization of Q, K, V projections as A @ B</sub> | <sub>Up to 8x fewer params and FLOPs per attention projection at rank=32</sub> | <sub>low_rank_layer.py</sub> |
+| <sub>B1</sub> | <sub>Systems - Fused Kernel</sub> | <sub>Memory bandwidth waste from writing intermediate activations to HBM</sub> | <sub>Triton fused matmul + GELU in a single kernel pass, no intermediate buffer</sub> | <sub>Eliminates one full HBM read+write per feedforward sublayer per step</sub> | <sub>fused_kernel.py</sub> |
+| <sub>B2</sub> | <sub>Systems - Quantization</sub> | <sub>Weight memory footprint and memory bandwidth during linear projection</sub> | <sub>INT8 symmetric per-tensor quantization with straight-through estimator for QAT</sub> | <sub>4x weight memory reduction; INT8 GEMM capable on tensor-core hardware</sub> | <sub>fused_kernel.py</sub> |
+| <sub>B3</sub> | <sub>Systems - CUDA Kernel</sub> | <sub>Fused activation + quantization without intermediate memory buffers</sub> | <sub>Hand-written CUDA C++ kernel: ReLU + INT8 quant + dequant in one launch</sub> | <sub>Eliminates kernel launch overhead and intermediate tensor allocation</sub> | <sub>custom_cuda/</sub> |
+| <sub>C1</sub> | <sub>Convergence - Optimizer</sub> | <sub>Weight decay incorrectly applied to 1-D parameters such as biases and LN scales</sub> | <sub>AdamW with separate param groups; fused CUDA AdamW kernel when available</sub> | <sub>Correct regularization geometry; faster parameter updates via kernel fusion</sub> | <sub>optimizer.py</sub> |
+| <sub>C2</sub> | <sub>Convergence - Scheduling</sub> | <sub>Large gradient updates early in training destabilize weights before they have structure</sub> | <sub>Linear warmup over first 10% of steps then cosine decay to 10% of peak LR</sub> | <sub>Prevents early divergence; smooth final convergence without hard LR drops</sub> | <sub>scheduler.py</sub> |
+| <sub>C3</sub> | <sub>Convergence - Pruning</sub> | <sub>Model capacity wasted on near-zero weights that contribute noise, not signal</sub> | <sub>Gradual magnitude pruning from 0% to 30% sparsity over the middle 70% of training</sub> | <sub>Reduced inference cost; implicit regularization effect on remaining weights</sub> | <sub>optimizer.py</sub> |
+
+> [!NOTE]
+> The three categories are listed in order of increasing subtlety. Category A optimizations (low-rank) are purely mathematical and can be derived from first principles. Category B optimizations (kernel fusion, quantization) require understanding GPU hardware memory hierarchy. Category C optimizations (scheduling, pruning) require understanding training dynamics and how loss landscapes evolve over time.
 
 ---
 
 ## Training Pipeline State Machine
 
-The following diagram describes the state each training step moves through, including where each optimization category intervenes.
+Every training step moves through a precise sequence of operations. Understanding this sequence is important for debugging, because a problem in step N will manifest as an error in step N+1. For example, NaN loss usually appears at the `ComputeLoss` state, but the root cause is typically an exploding gradient that should have been caught one step earlier at `ClipGrads`. The diagram below makes this sequence explicit and annotates which optimization category each state belongs to.
 
 ```mermaid
 stateDiagram-v2
@@ -182,24 +212,38 @@ stateDiagram-v2
     ProfilerEnd --> [*]
 ```
 
+> [!TIP]
+> The `set_to_none=True` flag in `zero_grad` is a meaningful optimization. Setting gradients to `None` instead of zero avoids allocating and writing a zero-filled tensor for each parameter, which reduces memory bandwidth consumption during the gradient reset phase. This is a recommended best practice in PyTorch 2.x.
+
+> [!WARNING]
+> The `GradScaler.update()` call must happen after `optimizer.step()`, not before. If skipped, the scaler will not adapt its scale factor, and the next `scaler.scale(loss).backward()` call will use a stale scale, potentially causing underflow in fp16 gradients. This is one of the most common AMP bugs in practice.
+
 ---
 
 ## Tech Stack
 
-The following table describes every library used in this project, why it was chosen, and what it provides that simpler alternatives cannot.
+The following table describes every library used in this project, why it was chosen over simpler alternatives, and what happens if it is absent. Understanding the tech stack is important because each library represents a deliberate tradeoff between portability, performance, and expressiveness.
 
-| <sub>Library</sub> | <sub>Version</sub> | <sub>Role</sub> | <sub>Why This Library</sub> | <sub>Fallback</sub> |
-|---|---|---|---|---|
-| <sub>torch</sub> | <sub>>=2.1.0</sub> | <sub>Core tensor operations, autograd, AMP, DataLoader, nn.Module</sub> | <sub>Industry standard; provides fused AdamW CUDA kernel via `fused=True`</sub> | <sub>None - required</sub> |
-| <sub>triton</sub> | <sub>>=2.1.0</sub> | <sub>JIT-compiled GPU kernels written in Python-like syntax</sub> | <sub>Allows writing custom CUDA-speed kernels without raw CUDA C++; auto-tunes tile sizes</sub> | <sub>PyTorch fallback in fused_kernel.py</sub> |
-| <sub>numpy</sub> | <sub>>=1.24.0</sub> | <sub>Array utilities in the analysis notebook</sub> | <sub>Standard numerical Python; required by matplotlib internals</sub> | <sub>Pure Python lists for simple cases</sub> |
-| <sub>matplotlib</sub> | <sub>>=3.7.0</sub> | <sub>Loss curves, LR schedule plots, FLOPs comparison charts in the notebook</sub> | <sub>Most compatible with Jupyter; produces publication-quality static plots</sub> | <sub>Any plotting library</sub> |
-| <sub>tqdm</sub> | <sub>>=4.65.0</sub> | <sub>Progress bars in training loops</sub> | <sub>Zero-overhead progress display; works in notebooks and terminals</sub> | <sub>Print statements</sub> |
-| <sub>ninja</sub> | <sub>>=1.11.0</sub> | <sub>Build system used by `torch.utils.cpp_extension.load()` to compile kernel.cu</sub> | <sub>Dramatically faster than make for incremental CUDA builds; parallel compilation</sub> | <sub>Make (slower)</sub> |
-| <sub>einops</sub> | <sub>>=0.7.0</sub> | <sub>Readable tensor rearrange operations (available for extension)</sub> | <sub>Makes shape manipulation self-documenting; eliminates reshape/transpose bugs</sub> | <sub>Manual view/transpose</sub> |
+**PyTorch** is the foundation. It provides automatic differentiation (autograd), the `nn.Module` abstraction, CUDA tensor operations, and the `torch.compile` / AMP infrastructure. All other libraries in this stack either wrap PyTorch or plug into its extension system.
+
+**Triton** is OpenAI's domain-specific language for writing GPU kernels in Python-like syntax that compiles to PTX (Parallel Thread Execution), the NVIDIA GPU assembly language. Triton auto-tunes tile sizes for your specific GPU architecture and handles thread coarsening automatically. Without Triton, writing the fused LinearGELU kernel would require raw CUDA C++, which is significantly more verbose and architecture-specific.
+
+**Ninja** is the build system used by `torch.utils.cpp_extension.load()` to compile `kernel.cu` at runtime. Ninja uses file checksums instead of timestamps to determine which files need recompilation, making incremental CUDA builds significantly faster than Make. It also supports parallel compilation across multiple CUDA translation units.
+
+| <sub>#</sub> | <sub>Library</sub> | <sub>Version</sub> | <sub>Role in This Project</sub> | <sub>Why This Library Was Chosen</sub> | <sub>Fallback If Absent</sub> |
+|---|---|---|---|---|---|
+| <sub>1</sub> | <sub>torch</sub> | <sub>>=2.1.0</sub> | <sub>Core tensor operations, autograd, AMP, DataLoader, nn.Module backbone</sub> | <sub>Industry standard; provides fused AdamW CUDA kernel via fused=True; best-in-class autograd</sub> | <sub>None - required</sub> |
+| <sub>2</sub> | <sub>triton</sub> | <sub>>=2.1.0</sub> | <sub>JIT-compiled GPU kernels written in Python-like syntax for FusedLinearGELU</sub> | <sub>Allows writing custom CUDA-speed kernels without raw CUDA C++; auto-tunes tile sizes per GPU</sub> | <sub>Pure PyTorch fallback in fused_kernel.py</sub> |
+| <sub>3</sub> | <sub>numpy</sub> | <sub>>=1.24.0</sub> | <sub>Array utilities and interop in the analysis notebook</sub> | <sub>Standard numerical Python; required by matplotlib internals for plot data</sub> | <sub>Pure Python lists for simple aggregations</sub> |
+| <sub>4</sub> | <sub>matplotlib</sub> | <sub>>=3.7.0</sub> | <sub>Loss curves, LR schedule plots, FLOPs comparison charts in the notebook</sub> | <sub>Most compatible with Jupyter; produces publication-quality static plots with minimal code</sub> | <sub>Any plotting library (plotly, seaborn, etc.)</sub> |
+| <sub>5</sub> | <sub>tqdm</sub> | <sub>>=4.65.0</sub> | <sub>Progress bars in training loops with ETA and steps/sec display</sub> | <sub>Zero-overhead progress display; works in both notebooks (tqdm.notebook) and terminals</sub> | <sub>Print statements every log_interval steps</sub> |
+| <sub>6</sub> | <sub>ninja</sub> | <sub>>=1.11.0</sub> | <sub>Build system used by torch.utils.cpp_extension.load() to compile kernel.cu</sub> | <sub>Dramatically faster than Make for incremental CUDA builds; supports parallel compilation</sub> | <sub>Make (slower, may not be installed)</sub> |
+| <sub>7</sub> | <sub>einops</sub> | <sub>>=0.7.0</sub> | <sub>Readable tensor rearrange operations available for extension</sub> | <sub>Makes shape manipulation self-documenting; eliminates reshape/transpose bugs in attention code</sub> | <sub>Manual view/transpose/permute calls</sub> |
+| <sub>8</sub> | <sub>scipy</sub> | <sub>>=1.11.0</sub> | <sub>Statistical utilities in the analysis notebook for significance testing</sub> | <sub>Provides scipy.stats for curve fitting and correlation analysis of training metrics</sub> | <sub>Manual numpy implementations</sub> |
+| <sub>9</sub> | <sub>jupyter</sub> | <sub>>=1.0.0</sub> | <sub>Interactive environment for running analysis.ipynb</sub> | <sub>Standard for ML analysis; allows inline plots and incremental computation</sub> | <sub>Convert notebook cells to a .py script</sub> |
 
 > [!WARNING]
-> Triton requires a CUDA-capable GPU and a compatible CUDA toolkit. If you are on CPU or an unsupported GPU, `import triton` will fail silently (caught at import time) and the project will use the pure PyTorch fallback for all kernel operations. No functionality is lost - only the speedup from the fused kernel is unavailable.
+> Triton requires a CUDA-capable GPU and a compatible CUDA toolkit. If you are on CPU or an unsupported GPU, `import triton` will raise an ImportError that is caught at import time in `fused_kernel.py`, and the project will use the pure PyTorch fallback for all kernel operations. No functionality is lost - only the speedup from the fused kernel is unavailable.
 
 ---
 
@@ -251,7 +295,7 @@ unified-ml-optimizations/
 
 ### Prerequisites
 
-You need Python 3.10+ and pip. A CUDA GPU is optional but recommended for the fused kernel and quantization paths.
+You need Python 3.10+ and pip. A CUDA GPU is optional but recommended for the fused kernel and quantization paths. The virtual environment isolates the project's dependencies from your system Python so that version conflicts with other projects are avoided.
 
 ```bash
 # Clone or navigate to the project
@@ -268,7 +312,7 @@ pip install -r requirements.txt
 
 ### Run a 50-step smoke test (CPU, ~4 seconds)
 
-This uses a tiny model (d_model=128, 2 layers, seq_len=32) to verify every component imports cleanly and produces decreasing loss.
+The `--fast` flag instantiates a tiny model (`d_model=128`, 2 layers, `seq_len=32`) and runs exactly 50 optimizer steps. This is sufficient to verify that every component imports cleanly, the forward pass produces finite outputs, and the loss decreases at least once. The fast mode exercises all three optimization categories with minimal compute.
 
 ```bash
 python src/main.py --fast
@@ -276,56 +320,74 @@ python src/main.py --fast
 
 ### Run full training (GPU recommended)
 
+Full training runs for 1,000 gradient steps with the default configuration: `d_model=512`, 6 layers, `seq_len=128`, batch size 64. On a modern GPU (RTX 3080 or better), this completes in approximately 2 minutes. On CPU, expect 15-25 minutes.
+
 ```bash
 python src/main.py
 ```
 
+### Run with PyTorch profiler
+
+The profiler writes a Chrome-trace-format JSON to `./profile_trace/` that can be opened in `chrome://tracing` or the PyTorch TensorBoard plugin to visualize kernel timings per layer.
+
+```bash
+python src/main.py --profile
+```
+
 ### Open the analysis notebook
+
+The analysis notebook contains 5 pre-written cells that plot the LR schedule, compare FLOPs between full-rank and low-rank attention, visualize the sparsity ramp, and display training loss curves from the most recent run.
 
 ```bash
 jupyter notebook notebooks/analysis.ipynb
 ```
 
 > [!TIP]
-> The `--fast` flag is the fastest way to check that a code change hasn't broken anything. It completes in under 10 seconds on any modern CPU and exercises all three optimization categories with minimal compute.
+> The `--fast` flag is the fastest way to check that a code change has not broken anything. It completes in under 10 seconds on any modern CPU and exercises all three optimization categories with minimal compute. Use it after every non-trivial edit before committing.
 
 ---
 
 ## Configuration Reference
 
-All hyperparameters are centralized in `src/utils/config.py` as Python dataclasses. There are no YAML files or argument parsers to manage - just instantiate the dataclasses with keyword overrides.
+All hyperparameters are centralized in `src/utils/config.py` as Python dataclasses. There are no YAML files or argument parsers to manage - just instantiate the dataclasses with keyword overrides. This design makes configuration type-checked at import time, makes IDE autocomplete work correctly, and eliminates the runtime errors caused by misspelled YAML keys.
 
-### ModelConfig
+> [!NOTE]
+> A Python dataclass (`@dataclass`) is a class where `__init__`, `__repr__`, and `__eq__` are automatically generated from the field annotations. This means you get free pretty-printing of your config (`print(cfg)` shows all fields and values) and free equality comparison (`cfg_a == cfg_b` compares field-by-field).
 
-Controls the architecture of `OptimizedTransformer`. These fields determine the size and shape of every tensor in the model.
+### ModelConfig - Architecture Shape
 
-| <sub>Field</sub> | <sub>Default</sub> | <sub>Type</sub> | <sub>Description</sub> | <sub>Impact</sub> |
-|---|---|---|---|---|
-| <sub>vocab_size</sub> | <sub>16384</sub> | <sub>int</sub> | <sub>Number of token embeddings</sub> | <sub>Embedding table size: vocab_size * d_model floats</sub> |
-| <sub>d_model</sub> | <sub>512</sub> | <sub>int</sub> | <sub>Hidden dimension throughout the model</sub> | <sub>Dominant factor in FLOPs and parameter count</sub> |
-| <sub>n_heads</sub> | <sub>8</sub> | <sub>int</sub> | <sub>Number of attention heads; must divide d_model</sub> | <sub>Affects head dimension = d_model / n_heads</sub> |
-| <sub>n_layers</sub> | <sub>6</sub> | <sub>int</sub> | <sub>Number of stacked TransformerBlocks</sub> | <sub>Linear multiplier on depth-related FLOPs</sub> |
-| <sub>seq_len</sub> | <sub>128</sub> | <sub>int</sub> | <sub>Maximum input sequence length</sub> | <sub>Positional embedding table size; attention is O(L²)</sub> |
-| <sub>rank</sub> | <sub>32</sub> | <sub>int</sub> | <sub>Low-rank bottleneck for Q/K/V projections</sub> | <sub>Lower rank = fewer params/FLOPs but less expressivity</sub> |
-| <sub>dropout</sub> | <sub>0.1</sub> | <sub>float</sub> | <sub>Dropout rate applied throughout</sub> | <sub>Higher dropout = stronger regularization</sub> |
-| <sub>num_classes</sub> | <sub>10</sub> | <sub>int</sub> | <sub>Output classes for the classifier head</sub> | <sub>Final linear layer output dimension</sub> |
+Controls the architecture of `OptimizedTransformer`. These fields determine the size and shape of every tensor in the model. Changing `d_model` has a quadratic effect on parameter count (it affects both the width and depth of most linear layers), so small changes produce large memory differences.
 
-### TrainingConfig
+| <sub>#</sub> | <sub>Field</sub> | <sub>Default</sub> | <sub>Type</sub> | <sub>Description</sub> | <sub>Impact on Model Size</sub> | <sub>Valid Range</sub> |
+|---|---|---|---|---|---|---|
+| <sub>1</sub> | <sub>vocab_size</sub> | <sub>16384</sub> | <sub>int</sub> | <sub>Number of token embeddings in the lookup table</sub> | <sub>Embedding table: vocab_size * d_model floats (33M bytes at default)</sub> | <sub>>= num_classes</sub> |
+| <sub>2</sub> | <sub>d_model</sub> | <sub>512</sub> | <sub>int</sub> | <sub>Hidden dimension throughout all layers</sub> | <sub>Dominant factor in FLOPs and param count; scales quadratically</sub> | <sub>Must be divisible by n_heads</sub> |
+| <sub>3</sub> | <sub>n_heads</sub> | <sub>8</sub> | <sub>int</sub> | <sub>Number of attention heads; determines head_dim = d_model / n_heads</sub> | <sub>Affects attention expressivity; more heads = finer-grained attention patterns</sub> | <sub>Must divide d_model evenly</sub> |
+| <sub>4</sub> | <sub>n_layers</sub> | <sub>6</sub> | <sub>int</sub> | <sub>Number of stacked TransformerBlocks</sub> | <sub>Linear multiplier on both depth-related FLOPs and parameter count</sub> | <sub>>= 1</sub> |
+| <sub>5</sub> | <sub>seq_len</sub> | <sub>128</sub> | <sub>int</sub> | <sub>Maximum input sequence length for positional embeddings</sub> | <sub>Positional embedding table; attention is O(L^2) so long seqs are expensive</sub> | <sub>>= 1</sub> |
+| <sub>6</sub> | <sub>rank</sub> | <sub>32</sub> | <sub>int</sub> | <sub>Low-rank bottleneck dimension for Q/K/V projections</sub> | <sub>Lower rank = fewer params and FLOPs but reduced attention expressivity</sub> | <sub>1 to d_model</sub> |
+| <sub>7</sub> | <sub>dropout</sub> | <sub>0.1</sub> | <sub>float</sub> | <sub>Dropout probability applied to attention weights and feedforward activations</sub> | <sub>No effect on param count; higher = stronger regularization</sub> | <sub>0.0 to 0.5</sub> |
+| <sub>8</sub> | <sub>num_classes</sub> | <sub>10</sub> | <sub>int</sub> | <sub>Output classes for the quantized classifier head</sub> | <sub>Final linear layer: d_model * num_classes parameters</sub> | <sub>>= 2</sub> |
 
-Controls everything about the training run: optimizer, scheduling, hardware, and logging.
+### TrainingConfig - Optimizer and Runtime
 
-| <sub>Field</sub> | <sub>Default</sub> | <sub>Type</sub> | <sub>Description</sub> | <sub>Notes</sub> |
-|---|---|---|---|---|
-| <sub>batch_size</sub> | <sub>64</sub> | <sub>int</sub> | <sub>Samples per gradient update</sub> | <sub>Larger = more stable gradients; limited by GPU VRAM</sub> |
-| <sub>lr</sub> | <sub>3e-4</sub> | <sub>float</sub> | <sub>Peak learning rate for AdamW</sub> | <sub>The cosine schedule decays this to 3e-5 by end of training</sub> |
-| <sub>weight_decay</sub> | <sub>0.1</sub> | <sub>float</sub> | <sub>L2 regularization for 2-D weight matrices only</sub> | <sub>Not applied to biases or LayerNorm parameters</sub> |
-| <sub>max_steps</sub> | <sub>1000</sub> | <sub>int</sub> | <sub>Total gradient update steps before stopping</sub> | <sub>Training loops until this is reached regardless of epoch count</sub> |
-| <sub>warmup_steps</sub> | <sub>100</sub> | <sub>int</sub> | <sub>Steps over which LR ramps from 0 to peak</sub> | <sub>Typically 10% of max_steps is a good default</sub> |
-| <sub>grad_clip</sub> | <sub>1.0</sub> | <sub>float</sub> | <sub>Max gradient norm for clipping</sub> | <sub>Prevents exploding gradients; 1.0 is safe for most Transformers</sub> |
-| <sub>log_interval</sub> | <sub>50</sub> | <sub>int</sub> | <sub>Print metrics every N steps</sub> | <sub>No effect on training; only affects terminal output frequency</sub> |
-| <sub>device</sub> | <sub>"cuda"</sub> | <sub>str</sub> | <sub>Target device; auto-falls-back to CPU</sub> | <sub>Set to "cpu" to force CPU execution</sub> |
-| <sub>use_amp</sub> | <sub>True</sub> | <sub>bool</sub> | <sub>Enable Automatic Mixed Precision (fp16/bf16)</sub> | <sub>Only active when device=="cuda"; ignored on CPU</sub> |
-| <sub>profile</sub> | <sub>False</sub> | <sub>bool</sub> | <sub>Write torch.profiler trace to ./profile_trace/</sub> | <sub>Use for diagnosis; adds overhead, disable in production</sub> |
+Controls everything about the training run: optimizer hyperparameters, scheduling, hardware device selection, and logging frequency. These fields can be overridden at instantiation without touching any source files, making it easy to script hyperparameter sweeps.
+
+| <sub>#</sub> | <sub>Field</sub> | <sub>Default</sub> | <sub>Type</sub> | <sub>Description</sub> | <sub>Tuning Notes</sub> |
+|---|---|---|---|---|---|
+| <sub>1</sub> | <sub>batch_size</sub> | <sub>64</sub> | <sub>int</sub> | <sub>Number of samples per gradient update step</sub> | <sub>Larger batches give more stable gradient estimates but require more GPU VRAM</sub> |
+| <sub>2</sub> | <sub>lr</sub> | <sub>3e-4</sub> | <sub>float</sub> | <sub>Peak learning rate passed to AdamW</sub> | <sub>The cosine schedule decays this to lr * min_lr_ratio (3e-5) by end of training</sub> |
+| <sub>3</sub> | <sub>weight_decay</sub> | <sub>0.1</sub> | <sub>float</sub> | <sub>L2 regularization coefficient for 2-D weight matrices only</sub> | <sub>Not applied to biases or LayerNorm parameters (see Category C1 explanation)</sub> |
+| <sub>4</sub> | <sub>max_steps</sub> | <sub>1000</sub> | <sub>int</sub> | <sub>Total gradient update steps before training terminates</sub> | <sub>Training loops until this count regardless of epoch count</sub> |
+| <sub>5</sub> | <sub>warmup_steps</sub> | <sub>100</sub> | <sub>int</sub> | <sub>Steps over which LR ramps linearly from 0 to peak value</sub> | <sub>Typically 5-10% of max_steps; prevents gradient explosion at initialization</sub> |
+| <sub>6</sub> | <sub>grad_clip</sub> | <sub>1.0</sub> | <sub>float</sub> | <sub>Maximum gradient norm for clip_grad_norm_ before optimizer step</sub> | <sub>1.0 is safe for most Transformers; lower if loss goes NaN</sub> |
+| <sub>7</sub> | <sub>log_interval</sub> | <sub>50</sub> | <sub>int</sub> | <sub>Print loss, LR, and throughput metrics every N steps</sub> | <sub>No effect on training outcome; only controls terminal output frequency</sub> |
+| <sub>8</sub> | <sub>device</sub> | <sub>"cuda"</sub> | <sub>str</sub> | <sub>Target device string; auto-falls-back to CPU if CUDA unavailable</sub> | <sub>Set to "cpu" to force CPU execution for debugging</sub> |
+| <sub>9</sub> | <sub>use_amp</sub> | <sub>True</sub> | <sub>bool</sub> | <sub>Enable Automatic Mixed Precision forward pass in fp16 or bf16</sub> | <sub>Only active when device=="cuda"; silently ignored on CPU</sub> |
+| <sub>10</sub> | <sub>profile</sub> | <sub>False</sub> | <sub>bool</sub> | <sub>Write torch.profiler Chrome-trace JSON to ./profile_trace/</sub> | <sub>Adds overhead; disable in production or performance benchmarks</sub> |
+
+> [!IMPORTANT]
+> `warmup_steps` should always be less than `max_steps`. If `warmup_steps >= max_steps`, the cosine decay phase never starts and the learning rate never drops, which will cause the model to continue taking large gradient steps into the final epochs, destabilizing convergence. A safe rule of thumb is `warmup_steps = max_steps // 10`.
 
 ---
 
