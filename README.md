@@ -521,40 +521,34 @@ The project runs on a spectrum of hardware, from a laptop CPU to a data-center G
 > To use Apple Silicon MPS acceleration, set `device="mps"` in `TrainingConfig`. The MPS backend supports most PyTorch operations but does not support the CUDA-specific `fused=True` optimizer flag or the custom CUDA kernel. Both will fall back gracefully. AMP with MPS is experimental in PyTorch 2.x and may produce inconsistent results on some operations.
 
 ---
-| <sub>128</sub> | <sub>131,072</sub> | <sub>393,216</sub> | <sub>-50%</sub> | <sub>2.0×</sub> | <sub>Light compression; minimal accuracy impact</sub> |
-| <sub>64</sub> | <sub>65,536</sub> | <sub>196,608</sub> | <sub>-75%</sub> | <sub>4.0×</sub> | <sub>Good balance for most classification tasks</sub> |
-| <sub>32 (default)</sub> | <sub>32,768</sub> | <sub>98,304</sub> | <sub>-87.5%</sub> | <sub>8.0×</sub> | <sub>Strong compression; works for synthetic tasks</sub> |
-| <sub>16</sub> | <sub>16,384</sub> | <sub>49,152</sub> | <sub>-93.75%</sub> | <sub>16.0×</sub> | <sub>Aggressive; use for small embedding spaces</sub> |
-| <sub>8</sub> | <sub>8,192</sub> | <sub>24,576</sub> | <sub>-96.875%</sub> | <sub>32.0×</sub> | <sub>Extreme compression; expect accuracy degradation</sub> |
-
-> [!CAUTION]
-> Compression ratios above 8x (rank <= 32 for d_model=512) will likely reduce model expressivity enough to impact accuracy on real-world datasets. The synthetic classification task used in this project is simple enough that even rank=8 converges, but production models should be benchmarked carefully before choosing a rank.
-
----
-
 ## API Reference
 
+The API reference below is organized by module. Each collapsible section contains the full interface for every exported class and function, including constructor signatures, parameter descriptions, return types, and usage examples. All code examples assume `import torch` and that the virtual environment is activated.
+
 <details>
-<summary><strong>📦 src/utils/config.py</strong> - Configuration dataclasses</summary>
+<summary><strong>📦 src/utils/config.py - Configuration dataclasses</strong></summary>
 
 ### `ModelConfig`
 
-Defines the shape of the `OptimizedTransformer`. All fields have defaults that produce a 458K-parameter model suitable for a CPU smoke test.
+Defines the shape of the `OptimizedTransformer`. All fields have defaults that produce a model suitable for a CPU smoke test. Fields are validated at instantiation via `__post_init__`.
 
 ```python
 from src.utils.config import ModelConfig
 
 cfg = ModelConfig(
-    vocab_size=16384,   # token vocabulary size
-    d_model=512,        # hidden dimension
-    n_heads=8,          # attention heads (must divide d_model)
-    n_layers=6,         # number of TransformerBlocks
-    seq_len=128,        # max sequence length
-    rank=32,            # low-rank bottleneck dimension
-    dropout=0.1,        # dropout applied throughout
-    num_classes=10,     # output classes
+    vocab_size=16384,   # token vocabulary size - determines embedding table rows
+    d_model=512,        # hidden dimension - must be divisible by n_heads
+    n_heads=8,          # attention heads - head_dim = d_model / n_heads = 64
+    n_layers=6,         # number of TransformerBlocks stacked sequentially
+    seq_len=128,        # max sequence length - used for positional embedding table
+    rank=32,            # low-rank bottleneck dimension for Q/K/V projections
+    dropout=0.1,        # dropout probability applied throughout
+    num_classes=10,     # output classes for the classifier head
 )
 ```
+
+> [!TIP]
+> For a fast CPU smoke test, use `ModelConfig(d_model=128, n_heads=4, n_layers=2, seq_len=32, vocab_size=1024)`. This reduces the parameter count from ~13M to ~200K and cuts smoke test time from 4 seconds to under 1 second.
 
 ### `TrainingConfig`
 
@@ -564,106 +558,138 @@ Controls the training run. Device auto-falls-back to CPU if CUDA unavailable.
 from src.utils.config import TrainingConfig
 
 cfg = TrainingConfig(
-    batch_size=64,
-    lr=3e-4,
-    weight_decay=0.1,
-    max_steps=1000,
-    warmup_steps=100,
-    grad_clip=1.0,
-    log_interval=50,
-    device="cuda",
-    use_amp=True,
-    profile=False,
+    batch_size=64,       # samples per gradient update step
+    lr=3e-4,             # peak AdamW learning rate
+    weight_decay=0.1,    # L2 reg coefficient (applied only to 2-D params)
+    max_steps=1000,      # total optimizer steps before training terminates
+    warmup_steps=100,    # linear LR warmup duration (10% of max_steps)
+    grad_clip=1.0,       # max gradient L2 norm before clipping
+    log_interval=50,     # print metrics every N steps
+    device="cuda",       # auto-falls-back to CPU if CUDA unavailable
+    use_amp=True,        # enable fp16/bf16 autocast (CUDA only)
+    profile=False,       # write torch.profiler trace to ./profile_trace/
 )
 ```
 
 </details>
 
 <details>
-<summary><strong>📦 src/models/low_rank_layer.py</strong> - Category A: Mathematical optimization</summary>
+<summary><strong>📦 src/models/low_rank_layer.py - Category A: Mathematical optimization</strong></summary>
 
 ### `LowRankLinear(in_features, out_features, rank, bias=True, init_scale=0.01)`
 
-A drop-in replacement for `nn.Linear` that factorizes the weight matrix into `A @ B` where `A` is `(in_features, rank)` and `B` is `(rank, out_features)`. The parameter count is `rank * (in_features + out_features)` instead of `in_features * out_features`.
+A drop-in replacement for `nn.Linear` that factorizes the weight matrix into two matrices `A @ B`. Matrix A has shape `(in_features, rank)` and matrix B has shape `(rank, out_features)`. The total parameter count is `rank * (in_features + out_features) + out_features` (for bias), compared to `in_features * out_features + out_features` for a full-rank linear.
+
+**Parameters:**
+- `in_features` - Input dimension (same as `nn.Linear`)
+- `out_features` - Output dimension (same as `nn.Linear`)
+- `rank` - Bottleneck dimension. Must be > 0 and <= min(in_features, out_features)
+- `bias` - Whether to add a learnable bias to the output (default True)
+- `init_scale` - Standard deviation for initializing matrix B near zero (default 0.01)
 
 ```python
 from src.models.low_rank_layer import LowRankLinear
 
-# Standard: 512 * 512 = 262,144 parameters
+# Standard linear: 512 * 512 = 262,144 parameters
 full = torch.nn.Linear(512, 512)
 
-# Low-rank r=32: 32 * (512 + 512) = 32,768 parameters (8x fewer)
+# Low-rank r=32: 32 * (512 + 512) = 32,768 parameters - 8x fewer
 low_rank = LowRankLinear(512, 512, rank=32)
 
 x = torch.randn(4, 16, 512)
-out = low_rank(x)   # shape: (4, 16, 512)
+out = low_rank(x)   # shape: (4, 16, 512) - same interface as nn.Linear
 ```
 
 ### `LowRankAttention(d_model, n_heads, rank, dropout=0.1)`
 
-Multi-head attention where all three projections (Q, K, V) use `LowRankLinear`. The output projection remains full-rank. The interface is identical to a standard `nn.MultiheadAttention` forward pass.
+Multi-head attention where all three projections (Q, K, V) use `LowRankLinear`. The output projection remains full-rank because it maps from `d_model` back to `d_model` and is applied only once per block (not per head). The interface is equivalent to a standard self-attention forward pass.
+
+**Parameters:**
+- `d_model` - Model hidden dimension
+- `n_heads` - Number of attention heads; must divide d_model
+- `rank` - Low-rank bottleneck for Q, K, V projections
+- `dropout` - Dropout applied to attention weights
 
 ```python
 from src.models.low_rank_layer import LowRankAttention
 
 attn = LowRankAttention(d_model=512, n_heads=8, rank=32)
-x = torch.randn(4, 64, 512)   # (batch, seq, d_model)
-out = attn(x)                  # (4, 64, 512)
+x = torch.randn(4, 64, 512)   # (batch_size, seq_len, d_model)
+out = attn(x)                  # (4, 64, 512) - same shape as input
 ```
 
 </details>
 
 <details>
-<summary><strong>📦 src/models/fused_kernel.py</strong> - Category B: Systems optimization</summary>
+<summary><strong>📦 src/models/fused_kernel.py - Category B: Systems optimization</strong></summary>
 
 ### `FusedLinearGELU(in_features, out_features, bias=True)`
 
-An `nn.Module` that fuses a linear projection and GELU activation into a single pass. On CUDA with Triton installed, dispatches to `_fused_linear_gelu_kernel`. On CPU or without Triton, falls back to `F.gelu(F.linear(x, weight, bias))`.
+An `nn.Module` that fuses a linear projection and GELU activation into a single GPU pass. On CUDA with Triton installed, dispatches to `_fused_linear_gelu_kernel`. On CPU or without Triton, falls back to `F.gelu(F.linear(x, weight, bias))`. The fallback is semantically identical - only performance differs.
+
+**Parameters:**
+- `in_features` - Input feature dimension
+- `out_features` - Output feature dimension (typically 4x in_features for FFN expansion)
+- `bias` - Whether to include a bias term
 
 ```python
 from src.models.fused_kernel import FusedLinearGELU
 
 layer = FusedLinearGELU(512, 2048).cuda()
 x = torch.randn(4, 64, 512).cuda()
-out = layer(x)   # (4, 64, 2048) - GELU already applied
+out = layer(x)   # (4, 64, 2048) - GELU activation already applied to all elements
 ```
+
+> [!NOTE]
+> The Triton kernel path is selected automatically at runtime. You can inspect which path is active by checking `layer._use_triton` after construction. This attribute is `True` if Triton is available and the input is on CUDA, `False` otherwise.
 
 ### `QuantizedLinear(in_features, out_features, bits=8)`
 
-INT8-quantized linear layer using symmetric per-tensor quantization with a straight-through gradient estimator. Suitable for QAT (quantization-aware training). The `bits` argument can be 4 or 8.
+INT8-quantized linear layer using symmetric per-tensor quantization with a straight-through gradient estimator. Suitable for quantization-aware training (QAT). The `bits` argument supports 4 or 8.
+
+**Quantization scheme:**
+- Scale: `s = max(|W|) / (2^(bits-1) - 1)` = `max(|W|) / 127` for INT8
+- Quantize: `W_q = clamp(round(W / s), -127, 127)` cast to int8
+- Dequantize: `W_dq = W_q.float() * s` - this is what the matmul uses during training
+- STE gradient: `d_loss/d_W = d_loss/d_W_dq * 1` (identity through round)
 
 ```python
 from src.models.fused_kernel import QuantizedLinear
 
 head = QuantizedLinear(512, 10, bits=8)
 x = torch.randn(4, 512)
-out = head(x)   # (4, 10) - computed via quantized weight path
+out = head(x)   # (4, 10) - computed via quantized weight path with STE gradient
 ```
 
 </details>
 
 <details>
-<summary><strong>📦 src/training/optimizer.py</strong> - Category C: Optimizer and pruning</summary>
+<summary><strong>📦 src/training/optimizer.py - Category C: Optimizer and pruning</strong></summary>
 
 ### `build_adamw_optimizer(model, lr, weight_decay, betas=(0.9, 0.95), eps=1e-8)`
 
-Constructs an `AdamW` optimizer with two parameter groups: 2-D parameters receive `weight_decay` and 1-D parameters receive `weight_decay=0.0`. On CUDA, enables the fused AdamW kernel automatically.
+Constructs an `AdamW` optimizer with two parameter groups: 2-D parameters (`ndim >= 2`) receive the specified `weight_decay`, and 1-D parameters (`ndim < 2`, i.e., biases and LayerNorm parameters) receive `weight_decay=0.0`. On CUDA, enables the fused AdamW kernel automatically via `fused=True`.
+
+**Parameters:**
+- `model` - Any `nn.Module` instance
+- `lr` - Peak learning rate (will be modulated by the scheduler)
+- `weight_decay` - L2 regularization coefficient for 2-D weight matrices
+- `betas` - Adam momentum coefficients; `(0.9, 0.95)` is recommended for Transformers (GPT-style). The standard `(0.9, 0.999)` is also valid.
+- `eps` - Adam epsilon for numerical stability in the denominator
 
 ```python
 from src.training.optimizer import build_adamw_optimizer
 
-optimizer = build_adamw_optimizer(
-    model,
-    lr=3e-4,
-    weight_decay=0.1,
-)
-# optimizer.param_groups[0]['weight_decay'] == 0.1  (matrices)
-# optimizer.param_groups[1]['weight_decay'] == 0.0  (biases, LN)
+optimizer = build_adamw_optimizer(model, lr=3e-4, weight_decay=0.1)
+# optimizer.param_groups[0]['weight_decay'] == 0.1  (2-D matrices)
+# optimizer.param_groups[1]['weight_decay'] == 0.0  (biases, LN scale/shift)
 ```
 
 ### `DynamicPruner(model, target_sparsity=0.5, start_step=200, end_step=800)`
 
-Applies gradual magnitude-based unstructured sparsity to all 2-D weight tensors. Sparsity ramps linearly from 0% at `start_step` to `target_sparsity * 100`% at `end_step`. Call `.step(current_step)` after each `optimizer.step()`.
+Applies gradual magnitude-based unstructured sparsity to all 2-D weight tensors in the model. Sparsity ramps linearly from 0 at `start_step` to `target_sparsity` at `end_step`, then remains fixed. Call `.step(current_step)` after each `optimizer.step()` to advance the pruning schedule.
+
+**What "magnitude pruning" means:** At each `.step()` call, the `target_sparsity * 100`% of weights with the smallest absolute value are set to exactly zero by multiplying element-wise with a binary mask. The mask is computed fresh each step (no mask is stored between steps). This means weights that were previously pruned can in principle un-prune if their magnitude grows relative to the population - this is sometimes called "soft" magnitude pruning.
 
 ```python
 from src.training.optimizer import DynamicPruner
@@ -671,109 +697,200 @@ from src.training.optimizer import DynamicPruner
 pruner = DynamicPruner(model, target_sparsity=0.3, start_step=100, end_step=800)
 
 # Inside training loop, after optimizer.step():
-pruner.step(global_step)
+pruner.step(global_step)  # global_step is the 0-indexed step counter
 ```
+
+> [!CAUTION]
+> `DynamicPruner` does not create permanent sparse tensors. The zero weights are still stored in memory as floats; they do not reduce VRAM usage during training. The inference speedup from sparsity requires a sparse-aware inference runtime (e.g., NVIDIA's cuSPARSELt or a custom kernel) that can skip zero weights. The primary benefit during training is regularization, not memory savings.
 
 </details>
 
 <details>
-<summary><strong>📦 src/training/scheduler.py</strong> - Category C: LR scheduling</summary>
+<summary><strong>📦 src/training/scheduler.py - Category C: LR scheduling</strong></summary>
 
 ### `get_cosine_schedule_with_warmup(optimizer, warmup_steps, max_steps, min_lr_ratio=0.1)`
 
-Returns a `LambdaLR` scheduler that linearly ramps the LR from 0 to the optimizer's base LR over `warmup_steps`, then applies cosine decay down to `min_lr_ratio * base_lr` by `max_steps`.
+Returns a `LambdaLR` scheduler that applies the following piecewise LR function:
+- For `step < warmup_steps`: `lr = base_lr * (step / warmup_steps)` (linear ramp from 0)
+- For `step >= warmup_steps`: `lr = base_lr * (min_lr_ratio + 0.5*(1 - min_lr_ratio)*(1 + cos(pi * (step - warmup) / (max - warmup))))` (cosine decay to `min_lr_ratio * base_lr`)
+
+**Parameters:**
+- `optimizer` - The optimizer whose `lr` param groups will be scaled
+- `warmup_steps` - Number of linear ramp steps from 0 to base_lr
+- `max_steps` - Total training steps; defines the end of the cosine curve
+- `min_lr_ratio` - Fraction of base_lr to decay to at `max_steps` (default 0.1 = 10%)
 
 ```python
 from src.training.scheduler import get_cosine_schedule_with_warmup
 
 scheduler = get_cosine_schedule_with_warmup(
-    optimizer,
-    warmup_steps=100,
-    max_steps=1000,
-    min_lr_ratio=0.1,    # LR decays to 10% of peak
+    optimizer, warmup_steps=100, max_steps=1000, min_lr_ratio=0.1
 )
 
-# Each step:
+# Each step inside the training loop:
 scheduler.step()
 current_lr = scheduler.get_last_lr()[0]
+```
+
+> [!TIP]
+> `LambdaLR` applies a multiplicative factor to the optimizer's base LR. To verify the schedule is correct, you can plot it before training: `lrs = [get_lr_at_step(scheduler, s) for s in range(max_steps)]` where `get_lr_at_step` calls `.step()` and `.get_last_lr()[0]`.
+
+</details>
+
+<details>
+<summary><strong>📦 src/utils/metrics.py - Measurement utilities</strong></summary>
+
+### `AverageMeter(window_size=100)`
+
+Tracks a smoothed running average using a fixed-size `collections.deque`. The `.value` property returns the mean over the last `window_size` updates - useful for displaying a smoothed loss that does not jump from step to step. The `.global_avg` property returns the total mean over all updates since construction, which is useful for epoch-level reporting.
+
+```python
+from src.utils.metrics import AverageMeter
+
+meter = AverageMeter(window_size=50)
+for loss in training_losses:
+    meter.update(loss)
+
+print(f"Smoothed loss: {meter.value:.4f}")
+print(f"Global average: {meter.global_avg:.4f}")
+```
+
+### `estimate_flops(model, sample_input) -> int`
+
+Estimates forward-pass FLOPs by registering hooks on all `nn.Linear` layers and counting multiply-add operations. For each linear layer with input `(*, in_features)` producing output `(*, out_features)`, the FLOPs are `2 * batch_elements * in_features * out_features`. Returns the total as an integer. Hooks are always removed via `try/finally` to prevent them from persisting if an error occurs.
+
+```python
+from src.utils.metrics import estimate_flops
+
+sample = torch.zeros(1, 128, dtype=torch.long)   # (batch=1, seq_len=128)
+flops = estimate_flops(model, sample)
+print(f"Forward pass: {flops / 1e9:.2f} GFLOPs")
+```
+
+### `Stopwatch(use_cuda=True)`
+
+A CUDA-synchronized wall-clock timer. When `use_cuda=True`, calls `torch.cuda.synchronize()` before recording start and end timestamps. This is critical for accurate GPU timing because PyTorch GPU operations are asynchronous by default - without synchronization, the CPU timer returns before the GPU has finished executing queued kernels, giving misleadingly small measurements.
+
+```python
+from src.utils.metrics import Stopwatch
+
+timer = Stopwatch(use_cuda=True)
+with timer:
+    model(inputs)   # GPU kernels launch asynchronously
+
+print(f"Forward pass took {timer.elapsed * 1000:.2f} ms")
 ```
 
 </details>
 
 <details>
-<summary><strong>📦 src/utils/metrics.py</strong> - Measurement utilities</summary>
+<summary><strong>📦 src/models/custom_cuda/ - Hand-written CUDA extension</strong></summary>
 
-### `AverageMeter(window_size=100)`
+### `kernel.cu` - CUDA C++ source
 
-Tracks a smoothed running average using a fixed-size deque. The `.value` property returns the mean over the last `window_size` updates. The `.global_avg` property returns the total mean over all updates.
+A CUDA C++ kernel that computes `output[n,c] = dequant(clamp(round(ReLU(input[n,c]) / scale[c]), -127, 127)) * scale[c]` for each element. Uses per-channel scaling (one scale value per output channel `c`) and fuses ReLU, INT8 quantization, and dequantization into a single kernel launch to avoid intermediate memory writes. Grid and block dimensions are computed to cover the full `(N, C)` tensor with `BLOCK_SIZE=256` threads per block.
 
-### `estimate_flops(model, sample_input) -> int`
-
-Estimates forward-pass FLOPs by registering hooks on all `nn.Linear` layers and counting multiply-add operations. Returns the total as an integer. Hooks are cleaned up via `try/finally` regardless of errors.
-
-### `Stopwatch(use_cuda=True)`
-
-A CUDA-synchronized wall-clock timer. Calls `torch.cuda.synchronize()` before recording timestamps to prevent CPU-side timing from returning before the GPU has finished. Use as a context manager or via `.start()` / `.stop()` / `.elapsed`.
-
-</details>
-
-<details>
-<summary><strong>📦 src/models/custom_cuda/</strong> - Hand-written CUDA extension</summary>
-
-### `kernel.cu`
-
-A CUDA C++ kernel that computes `output[n,c] = dequant(clamp(round(ReLU(input[n,c]) / scale[c]), -127, 127)) * scale[c]` for each element. Uses per-channel scaling and fuses ReLU, quantization, and dequantization into a single kernel to avoid intermediate memory writes. Grid and block dimensions are computed to cover the full `(N, C)` tensor.
+The CUDA threading model used here: each thread handles one output element `(n, c)`. The grid is 2-D: `gridDim.x = ceil(N / BLOCK_SIZE)` covers the batch dimension, `gridDim.y = C` covers channels. This is a simple but correct thread mapping; a production kernel would use shared memory and vectorized loads (`float4`) for higher bandwidth utilization.
 
 ### `binding.py` - `fused_relu_quant_dequant(x, scale)`
 
-Python interface that attempts to JIT-compile `kernel.cu` on first import using `torch.utils.cpp_extension.load()`. If compilation fails (no CUDA toolkit, no nvcc), falls back to a pure PyTorch implementation that is semantically identical.
+Python interface that attempts to JIT-compile `kernel.cu` on first import using `torch.utils.cpp_extension.load()`. If compilation fails (no CUDA toolkit, no nvcc on PATH, version mismatch), the `CUDA_KERNEL_AVAILABLE` flag is set to `False` and the module falls back to a pure PyTorch implementation that is semantically identical but slower.
 
 ```python
 from src.models.custom_cuda.binding import fused_relu_quant_dequant
 
 x = torch.randn(128, 512).cuda()
+# Per-channel scale: one value per output channel
 scale = x.abs().max(dim=0).values.clamp(min=1e-8) / 127.0
-out = fused_relu_quant_dequant(x, scale)   # (128, 512)
+out = fused_relu_quant_dequant(x, scale)   # (128, 512) - ReLU + quant + dequant fused
 ```
 
 > [!NOTE]
-> First import will trigger CUDA JIT compilation which takes 30-60 seconds. Subsequent imports load the cached `.so` from PyTorch's extension build cache and are near-instantaneous.
+> First import triggers CUDA JIT compilation which takes 30-60 seconds. Subsequent imports in the same Python session (and future sessions) load the cached `.so` from PyTorch's extension build cache (`~/.cache/torch_extensions/`) and are near-instantaneous. The compilation only runs once per (kernel source hash, CUDA version, GPU architecture) combination.
 
 </details>
 
 ---
 
+## Extension Guide
+
+The codebase is designed to be modular. The following table describes the most common extension scenarios and which files to change.
+
+| <sub>#</sub> | <sub>Goal</sub> | <sub>Files to Change</sub> | <sub>Files to Leave Alone</sub> | <sub>Effort Estimate</sub> |
+|---|---|---|---|---|
+| <sub>1</sub> | <sub>Use a real dataset instead of synthetic</sub> | <sub>src/data/dataset.py only</sub> | <sub>Everything else</sub> | <sub>Low - replace the DataLoader factory</sub> |
+| <sub>2</sub> | <sub>Change rank of low-rank attention</sub> | <sub>src/utils/config.py (ModelConfig.rank field)</sub> | <sub>Everything else</sub> | <sub>Trivial - single integer change</sub> |
+| <sub>3</sub> | <sub>Add Flash Attention instead of standard attention</sub> | <sub>src/models/low_rank_layer.py (replace scaled_dot_product_attention call)</sub> | <sub>Everything else</sub> | <sub>Low - one function call change</sub> |
+| <sub>4</sub> | <sub>Replace cosine schedule with linear decay</sub> | <sub>src/training/scheduler.py (replace lambda function)</sub> | <sub>Everything else</sub> | <sub>Low - one lambda function</sub> |
+| <sub>5</sub> | <sub>Add a second quantization scheme (e.g., INT4)</sub> | <sub>src/models/fused_kernel.py (add new QuantizedLinear subclass)</sub> | <sub>base_model.py, config.py</sub> | <sub>Medium - new class, change config to select it</sub> |
+| <sub>6</sub> | <sub>Add multi-GPU training (DDP)</sub> | <sub>src/training/train.py (wrap model in DistributedDataParallel)</sub> | <sub>Models and optimizer files</sub> | <sub>Medium - add DDP init and barrier calls</sub> |
+| <sub>7</sub> | <sub>Add gradient checkpointing to save memory</sub> | <sub>src/models/base_model.py (wrap TransformerBlock forward in checkpoint())</sub> | <sub>Training and optimizer files</sub> | <sub>Low - one-line change per block</sub> |
+| <sub>8</sub> | <sub>Export model to ONNX for inference</sub> | <sub>Add export script; no src changes needed</sub> | <sub>All src/ files</sub> | <sub>Medium - handle INT8 and Triton op compatibility</sub> |
+
+---
+
 ## Troubleshooting
 
-| <sub>Symptom</sub> | <sub>Likely Cause</sub> | <sub>Fix</sub> |
-|---|---|---|
-| <sub>`ModuleNotFoundError: No module named 'torch'`</sub> | <sub>Running outside the virtualenv</sub> | <sub>`source .venv/bin/activate` then retry</sub> |
-| <sub>`ModuleNotFoundError: No module named 'triton'`</sub> | <sub>Triton not installed (it is optional)</sub> | <sub>`pip install triton` or ignore - PyTorch fallback is used automatically</sub> |
-| <sub>`CUDA out of memory`</sub> | <sub>batch_size or d_model too large for GPU VRAM</sub> | <sub>Reduce `batch_size` in TrainingConfig or use `--fast`</sub> |
-| <sub>`AssertionError: d_model must be divisible by n_heads`</sub> | <sub>Invalid ModelConfig combination</sub> | <sub>Ensure `d_model % n_heads == 0`</sub> |
-| <sub>Loss is NaN after warmup</sub> | <sub>LR too high; gradient exploding</sub> | <sub>Reduce `lr` by 10x or reduce `grad_clip` to 0.5</sub> |
-| <sub>CUDA kernel compilation fails</sub> | <sub>nvcc not on PATH or CUDA toolkit version mismatch</sub> | <sub>Install CUDA toolkit matching your PyTorch build; the Python fallback in binding.py will be used in the meantime</sub> |
-| <sub>`pin_memory` UserWarning on CPU</sub> | <sub>Normal warning when running without CUDA</sub> | <sub>Set `pin_memory=False` in DataLoader or ignore - it is cosmetic only</sub> |
+Most errors in this project fall into one of three categories: environment issues (wrong Python, missing packages, no CUDA), configuration issues (invalid hyperparameter combinations), or runtime issues (NaN loss, OOM). The table below covers the most common symptoms with their root causes and fixes.
+
+| <sub>#</sub> | <sub>Symptom</sub> | <sub>Likely Cause</sub> | <sub>Recommended Fix</sub> |
+|---|---|---|---|
+| <sub>1</sub> | <sub>`ModuleNotFoundError: No module named 'torch'`</sub> | <sub>Running outside the virtualenv or forgot to install requirements</sub> | <sub>`source .venv/bin/activate` then `pip install -r requirements.txt`</sub> |
+| <sub>2</sub> | <sub>`ModuleNotFoundError: No module named 'triton'`</sub> | <sub>Triton not installed; it is an optional dependency</sub> | <sub>`pip install triton` or ignore - PyTorch fallback is used automatically and logged</sub> |
+| <sub>3</sub> | <sub>`CUDA out of memory` during forward pass</sub> | <sub>batch_size or d_model too large for available GPU VRAM</sub> | <sub>Reduce `batch_size` in TrainingConfig; use `--fast` flag for a minimal-memory run</sub> |
+| <sub>4</sub> | <sub>`AssertionError: d_model must be divisible by n_heads`</sub> | <sub>Invalid ModelConfig: `d_model % n_heads != 0`</sub> | <sub>Ensure `d_model / n_heads` is an integer; default (512/8=64) is always valid</sub> |
+| <sub>5</sub> | <sub>Loss is NaN after warmup phase</sub> | <sub>Peak learning rate too high; gradient norm exceeding clip threshold before stabilizing</sub> | <sub>Reduce `lr` by 10x (to 3e-5) or reduce `grad_clip` to 0.5; also check for NaN in input data</sub> |
+| <sub>6</sub> | <sub>CUDA kernel compilation fails on first run</sub> | <sub>`nvcc` not on PATH or CUDA toolkit version does not match PyTorch's CUDA version</sub> | <sub>Check `nvcc --version` matches `torch.version.cuda`; the Python fallback in binding.py activates automatically</sub> |
+| <sub>7</sub> | <sub>`pin_memory` UserWarning on CPU runs</sub> | <sub>Normal warning when DataLoader pin_memory=True on a CPU-only machine</sub> | <sub>Set `pin_memory=False` in dataset.py DataLoader or ignore - warning is cosmetic, no functionality lost</sub> |
+| <sub>8</sub> | <sub>Training throughput very low on GPU (< 100 samples/sec)</sub> | <sub>AMP disabled, fused kernel not loading, or profiler enabled with high overhead</sub> | <sub>Verify `use_amp=True` and `profile=False`; check that Triton loaded by looking for "Triton kernel active" in logs</sub> |
+| <sub>9</sub> | <sub>Loss does not decrease past step 50 on --fast mode</sub> | <sub>Expected behavior - synthetic task with tiny model may plateau early</sub> | <sub>Run full training with default config to see meaningful convergence curves</sub> |
+| <sub>10</sub> | <sub>Stale CUDA kernel loaded after editing kernel.cu</sub> | <sub>torch.utils.cpp_extension caches compiled .so by name, not source hash</sub> | <sub>Delete `~/.cache/torch_extensions/` or change the extension `name` in binding.py to force recompilation</sub> |
 
 > [!WARNING]
-> If you modify `kernel.cu` and the old compiled `.so` is cached, you must either delete the Torch extension cache (`~/.cache/torch_extensions/`) or change the extension `name` in `binding.py` to force recompilation. Torch will not detect changes to the source `.cu` file automatically.
+> If you modify `kernel.cu` and the old compiled `.so` is cached, you must either delete the Torch extension cache (`~/.cache/torch_extensions/`) or change the extension `name` in `binding.py` to force recompilation. Torch does not detect changes to the `.cu` source file automatically because it caches by extension name, not by source content hash.
+
+> [!TIP]
+> When debugging training instability (NaN loss, loss explosion), always check the gradient norm before and after clipping. Add `print(torch.nn.utils.clip_grad_norm_(model.parameters(), float('inf')))` before the `clip_grad_norm_` call in `train.py` to see the raw gradient norm. A norm above 100 at early training steps indicates either a learning rate that is too high or a missing weight initialization somewhere.
+
+---
+
+## Glossary
+
+These terms appear throughout the codebase and documentation. They are defined here in the order in which a reader is most likely to encounter them.
+
+| <sub>#</sub> | <sub>Term</sub> | <sub>Definition</sub> | <sub>Where Used in This Project</sub> |
+|---|---|---|---|
+| <sub>1</sub> | <sub>HBM (High Bandwidth Memory)</sub> | <sub>The main GPU memory chip. Modern GPUs have 40-80 GB of HBM with 1-3 TB/s bandwidth. All tensors live here unless in registers or L1/L2 cache. Memory-bandwidth-bound operations are limited by how fast data can be moved between HBM and compute units.</sub> | <sub>Triton fused kernel avoids unnecessary HBM writes</sub> |
+| <sub>2</sub> | <sub>FLOP (Floating Point Operation)</sub> | <sub>A single arithmetic operation (multiply or add). FLOPs are used to measure the computational cost of a model's forward pass. A matrix multiply of (M, K) by (K, N) costs 2*M*K*N FLOPs (one multiply and one add per element).</sub> | <sub>estimate_flops() in metrics.py; low-rank compression tables</sub> |
+| <sub>3</sub> | <sub>AMP (Automatic Mixed Precision)</sub> | <sub>A training technique where the forward pass and loss computation run in fp16 or bf16 (16-bit float), and the parameter update runs in fp32 (32-bit float). Reduces memory bandwidth and activates fp16 tensor cores, typically giving 2-3x throughput improvement with no accuracy loss.</sub> | <sub>TrainingConfig.use_amp; GradScaler in train.py</sub> |
+| <sub>4</sub> | <sub>Pre-LN (Pre-Layer Normalization)</sub> | <sub>Placing LayerNorm before the self-attention and feedforward sub-layers instead of after (Post-LN). Pre-LN stabilizes training by bounding the gradient norm at initialization regardless of model depth. Post-LN requires careful learning rate tuning at scale.</sub> | <sub>TransformerBlock in base_model.py</sub> |
+| <sub>5</sub> | <sub>Low-Rank Decomposition</sub> | <sub>Approximating a weight matrix W (m x n) as the product of two smaller matrices A (m x r) and B (r x n), where r (the rank) is much smaller than m or n. Reduces parameter count from m*n to r*(m+n). The approximation quality depends on how well the original W's information is captured in rank-r space.</sub> | <sub>LowRankLinear, LowRankAttention in low_rank_layer.py</sub> |
+| <sub>6</sub> | <sub>QAT (Quantization-Aware Training)</sub> | <sub>Training a neural network while simulating the numerical effects of quantization in the forward pass. Fake quantization (quantize then immediately dequantize) is applied to weights and/or activations so the model learns to be robust to quantization noise before deployment.</sub> | <sub>QuantizedLinear in fused_kernel.py</sub> |
+| <sub>7</sub> | <sub>STE (Straight-Through Estimator)</sub> | <sub>A gradient approximation technique for non-differentiable operations like rounding. The gradient of `round(x)` is zero almost everywhere, which would prevent learning. STE replaces this zero gradient with the identity (gradient passes straight through as if round() were the identity function).</sub> | <sub>QuantizedLinear backward pass</sub> |
+| <sub>8</sub> | <sub>AdamW</sub> | <sub>Adam optimizer with decoupled weight decay. Fixes the L2 regularization bug in Adam+L2 where weight decay interacts incorrectly with the adaptive learning rate, causing stronger regularization for infrequently updated parameters. AdamW applies weight decay directly to parameters, not through the gradient.</sub> | <sub>build_adamw_optimizer in optimizer.py</sub> |
+| <sub>9</sub> | <sub>Cosine LR Schedule</sub> | <sub>A learning rate schedule that decays the learning rate following a cosine curve from its peak value to a minimum. Cosine decay is smooth and avoids the discontinuous drops of step-decay schedules, which can destabilize training at the transition points.</sub> | <sub>get_cosine_schedule_with_warmup in scheduler.py</sub> |
+| <sub>10</sub> | <sub>Magnitude Pruning</sub> | <sub>A sparsity technique that zeros out the N% of weights with the smallest absolute values at each pruning step. The rationale is that small weights contribute less to the output and can be removed with minimal accuracy impact. Gradual magnitude pruning (increasing N slowly over training) reduces the accuracy cost.</sub> | <sub>DynamicPruner in optimizer.py</sub> |
+| <sub>11</sub> | <sub>Triton (OpenAI)</sub> | <sub>A domain-specific language for writing GPU kernels in a Python-like syntax. Triton compiles to PTX (NVIDIA GPU assembly) and automatically handles thread tiling, memory coalescing, and auto-tuning for different GPU architectures. It is the middle ground between raw CUDA C++ and pure PyTorch.</sub> | <sub>_fused_linear_gelu_kernel in fused_kernel.py</sub> |
+| <sub>12</sub> | <sub>GradScaler</sub> | <sub>A PyTorch utility for AMP training that scales the loss up before the backward pass (to prevent fp16 underflow in gradients), then unscales gradients before the optimizer step. Adapts the scale factor automatically: increases it when no inf/NaN gradients are detected, decreases it when they are.</sub> | <sub>train.py training loop</sub> |
 
 ---
 
 ## References
 
-The techniques in this project are grounded in the following foundational papers and resources. Each reference is linked to the specific component it informs.
+The techniques in this project are grounded in the following foundational papers and resources. Each reference is linked to the specific component it informs, with a brief explanation of what specific idea was borrowed and why it applies here.
 
-| <sub>Reference</sub> | <sub>Authors</sub> | <sub>Year</sub> | <sub>Used In</sub> |
-|---|---|---|---|
-| <sub>LoRA: Low-Rank Adaptation of Large Language Models</sub> | <sub>Hu et al.</sub> | <sub>2021</sub> | <sub>LowRankLinear initialization strategy</sub> |
-| <sub>Attention Is All You Need</sub> | <sub>Vaswani et al.</sub> | <sub>2017</sub> | <sub>Overall Transformer architecture</sub> |
-| <sub>Decoupled Weight Decay Regularization (AdamW)</sub> | <sub>Loshchilov & Hutter</sub> | <sub>2019</sub> | <sub>build_adamw_optimizer</sub> |
-| <sub>To Prune, or Not to Prune (gradual magnitude pruning)</sub> | <sub>Zhu & Gupta</sub> | <sub>2018</sub> | <sub>DynamicPruner linear sparsity ramp</sub> |
-| <sub>On Layer Normalization in the Transformer Architecture (Pre-LN)</sub> | <sub>Xiong et al.</sub> | <sub>2020</sub> | <sub>TransformerBlock Pre-LN placement</sub> |
-| <sub>LLM.int8(): 8-bit Matrix Multiplication for Transformers at Scale</sub> | <sub>Dettmers et al.</sub> | <sub>2022</sub> | <sub>QuantizedLinear per-tensor INT8 scheme</sub> |
-| <sub>Triton: An Intermediate Language for GPU Kernels</sub> | <sub>Tillet et al.</sub> | <sub>2019</sub> | <sub>_fused_linear_gelu_kernel</sub> |
-| <sub>BERT: Pre-training of Deep Bidirectional Transformers</sub> | <sub>Devlin et al.</sub> | <sub>2019</sub> | <sub>Mean-pooling classification head design</sub> |
+| <sub>#</sub> | <sub>Reference Title</sub> | <sub>Authors</sub> | <sub>Year</sub> | <sub>Used In</sub> | <sub>Key Idea Borrowed</sub> |
+|---|---|---|---|---|---|
+| <sub>1</sub> | <sub>LoRA: Low-Rank Adaptation of Large Language Models</sub> | <sub>Hu et al.</sub> | <sub>2021</sub> | <sub>LowRankLinear initialization strategy</sub> | <sub>Initialize B near zero so A@B starts at zero; prevents random low-rank matrix from disrupting pretrained representations</sub> |
+| <sub>2</sub> | <sub>Attention Is All You Need</sub> | <sub>Vaswani et al.</sub> | <sub>2017</sub> | <sub>Overall Transformer architecture; multi-head attention; positional encoding</sub> | <sub>Original Transformer design: Q/K/V projections, multi-head scaling by 1/sqrt(d_head), residual connections</sub> |
+| <sub>3</sub> | <sub>Decoupled Weight Decay Regularization (AdamW)</sub> | <sub>Loshchilov and Hutter</sub> | <sub>2019</sub> | <sub>build_adamw_optimizer</sub> | <sub>Decouple weight decay from the Adam moment estimates to produce correct L2 regularization semantics</sub> |
+| <sub>4</sub> | <sub>To Prune, or Not to Prune: Exploring the Efficacy of Pruning for Model Compression</sub> | <sub>Zhu and Gupta</sub> | <sub>2018</sub> | <sub>DynamicPruner linear sparsity ramp</sub> | <sub>Gradual magnitude pruning with a cubic sparsity ramp outperforms one-shot pruning; adapted to linear ramp here</sub> |
+| <sub>5</sub> | <sub>On Layer Normalization in the Transformer Architecture (Pre-LN)</sub> | <sub>Xiong et al.</sub> | <sub>2020</sub> | <sub>TransformerBlock Pre-LN placement</sub> | <sub>Moving LayerNorm before the residual branch (Pre-LN) makes initialization-time gradient norm independent of depth</sub> |
+| <sub>6</sub> | <sub>LLM.int8(): 8-bit Matrix Multiplication for Transformers at Scale</sub> | <sub>Dettmers et al.</sub> | <sub>2022</sub> | <sub>QuantizedLinear per-tensor INT8 scheme</sub> | <sub>Symmetric per-tensor absolute-maximum scaling for INT8 quantization; motivation for fake-quant QAT path</sub> |
+| <sub>7</sub> | <sub>Triton: An Intermediate Language and Compiler for Tiled Neural Network Computations</sub> | <sub>Tillet et al.</sub> | <sub>2019</sub> | <sub>_fused_linear_gelu_kernel</sub> | <sub>Tile-based GPU kernel programming model; autotuning of BLOCK_M and BLOCK_N for the target GPU</sub> |
+| <sub>8</sub> | <sub>BERT: Pre-training of Deep Bidirectional Transformers for Language Understanding</sub> | <sub>Devlin et al.</sub> | <sub>2019</sub> | <sub>Mean-pooling classification head design</sub> | <sub>Mean-pooling over the sequence dimension followed by a linear classifier; alternative to CLS token pooling</sub> |
+| <sub>9</sub> | <sub>Mixed Precision Training</sub> | <sub>Micikevicius et al. (NVIDIA)</sub> | <sub>2018</sub> | <sub>GradScaler and autocast usage in train.py</sub> | <sub>Loss scaling to prevent fp16 gradient underflow; master weights in fp32 with fp16 forward pass</sub> |
+| <sub>10</sub> | <sub>SGDR: Stochastic Gradient Descent with Warm Restarts</sub> | <sub>Loshchilov and Hutter</sub> | <sub>2017</sub> | <sub>Cosine decay shape in get_cosine_schedule_with_warmup</sub> | <sub>Cosine annealing produces smoother loss curves than step decay; warm restarts idea adapted to single-cycle warmup here</sub> |
 
 ---
 
@@ -781,8 +898,12 @@ The techniques in this project are grounded in the following foundational papers
 
 **Built with PyTorch, Triton, and CUDA - runs everywhere from a laptop CPU to an A100.**
 
+*Three optimization categories. One model. One codebase. Fully composable.*
+
 [![Made with PyTorch](https://img.shields.io/badge/Made%20with-PyTorch-EE4C2C?style=flat-square&logo=pytorch)](https://pytorch.org)
 [![GPU Accelerated](https://img.shields.io/badge/GPU-Accelerated-76B900?style=flat-square&logo=nvidia)](https://developer.nvidia.com)
 [![CPU Fallback](https://img.shields.io/badge/CPU-Fallback%20Supported-blue?style=flat-square)]()
+[![Research Grade](https://img.shields.io/badge/Code-Research%20Grade-blueviolet?style=flat-square)]()
+[![NASA Docstrings](https://img.shields.io/badge/Docs-NASA%20Style%20Comments-0B3D91?style=flat-square)]()
 
 </div>
